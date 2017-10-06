@@ -11,10 +11,11 @@
 #![deny(missing_docs)]
 #![doc(html_root_url = "https://docs.rs/tokio-uds/0.1")]
 
-#[macro_use]
+extern crate bytes;
 extern crate futures;
 #[macro_use]
 extern crate tokio_core;
+extern crate tokio_io;
 extern crate mio;
 extern crate mio_uds;
 #[macro_use]
@@ -28,10 +29,11 @@ use std::os::unix::net::{self, SocketAddr};
 use std::os::unix::prelude::*;
 use std::path::Path;
 
+use bytes::{Buf, BufMut};
 use futures::{Future, Poll, Async, Stream};
 use futures::sync::oneshot;
 use tokio_core::reactor::{PollEvented, Handle};
-use tokio_core::io::{Io, IoStream};
+use tokio_io::{AsyncRead, AsyncWrite, IoStream};
 
 mod frame;
 pub use frame::{UnixDatagramFramed, UnixDatagramCodec};
@@ -147,7 +149,7 @@ impl UnixListener {
                             .map(move |io| {
                                 (UnixStream { io: io }, addr)
                             });
-                        tx.complete(res);
+                        drop(tx.send(res));
                         Ok(())
                     });
                     self.pending_accept = Some(rx);
@@ -177,7 +179,7 @@ impl UnixListener {
             }
         }
 
-        Incoming { inner: self }.boxed()
+        Box::new(Incoming { inner: self })
     }
 }
 
@@ -298,13 +300,23 @@ impl Write for UnixStream {
     }
 }
 
-impl Io for UnixStream {
-    fn poll_read(&mut self) -> Async<()> {
-        <UnixStream>::poll_read(self)
+impl AsyncRead for UnixStream {
+    unsafe fn prepare_uninitialized_buffer(&self, _: &mut [u8]) -> bool {
+        false
     }
 
-    fn poll_write(&mut self) -> Async<()> {
-        <UnixStream>::poll_write(self)
+    fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
+        <&UnixStream>::read_buf(&mut &*self, buf)
+    }
+}
+
+impl AsyncWrite for UnixStream {
+    fn shutdown(&mut self) -> Poll<(), io::Error> {
+        <&UnixStream>::shutdown(&mut &*self)
+    }
+
+    fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
+        <&UnixStream>::write_buf(&mut &*self, buf)
     }
 }
 
@@ -324,13 +336,62 @@ impl<'a> Write for &'a UnixStream {
     }
 }
 
-impl<'a> Io for &'a UnixStream {
-    fn poll_read(&mut self) -> Async<()> {
-        <UnixStream>::poll_read(self)
+impl<'a> AsyncRead for &'a UnixStream {
+    unsafe fn prepare_uninitialized_buffer(&self, _: &mut [u8]) -> bool {
+        false
     }
 
-    fn poll_write(&mut self) -> Async<()> {
-        <UnixStream>::poll_write(self)
+    fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
+        if let Async::NotReady = <UnixStream>::poll_read(self) {
+            return Ok(Async::NotReady);
+        }
+        // TODO: Implement read_bufs on mio::UnixStream
+        let r = unsafe {
+            let b = buf.bytes_mut();
+            self.io.get_ref().read(b)
+        };
+
+        match r {
+            Ok(n) => {
+                unsafe {
+                    buf.advance_mut(n);
+                }
+                Ok(Async::Ready(n))
+            },
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.io.need_read();
+                Ok(Async::NotReady)
+            },
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl<'a> AsyncWrite for &'a UnixStream {
+    fn shutdown(&mut self) -> Poll<(), io::Error> {
+        Ok(().into())
+    }
+
+    fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
+        if let Async::NotReady = <UnixStream>::poll_write(self) {
+            return Ok(Async::NotReady);
+        }
+        let r = {
+            // TODO: Implement write_bufs on mio::UnixStream
+            let b = buf.bytes();
+            self.io.get_ref().write(b)
+        };
+        match r {
+            Ok(n) => {
+                buf.advance(n);
+                Ok(Async::Ready(n))
+            },
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.io.need_write();
+                Ok(Async::NotReady)
+            },
+            Err(e) => Err(e),
+        }
     }
 }
 

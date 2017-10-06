@@ -16,8 +16,10 @@ travis-ci = { repository = "tokio-rs/tokio-uds" }
 appveyor = { repository = "alexcrichton/tokio-uds" }
 
 [dependencies]
+bytes = "0.4"
 mio = "0.6"
 mio-uds = "0.6.1"
 futures = "0.1"
 tokio-core = "0.1"
+tokio-io = "0.1"
 log = "0.3"
